@@ -1,0 +1,15 @@
+# Binaries and build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Local configuration
+settings.json
+
+# Editor and temporary files
+.vscode/
+.idea/
+*.tmp
+.agents/
