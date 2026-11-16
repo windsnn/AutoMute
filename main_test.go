@@ -167,7 +167,11 @@ func TestIsIgnoredExternalApp(t *testing.T) {
 		"Explorer.EXE",
 		"searchhost.exe",
 		"shellexperiencehost.exe",
+		"shellhost.exe",
+		"ShellHost.EXE",
 		"startmenuexperiencehost.exe",
+		"applicationframehost.exe",
+		"systemsettings.exe",
 		"[elevated:1234]",
 		"[protected:5678]",
 	}
@@ -662,6 +666,16 @@ func TestShouldStartMinimized(t *testing.T) {
 }
 
 func TestAutostartCycle(t *testing.T) {
+	// Check if write access to HKCU Run key is available in current test environment
+	var hCheckKey uintptr
+	keyNamePtr := syscall.StringToUTF16Ptr(runKeyPath)
+	retCheck, _, _ := procRegOpenKeyEx.Call(HKEY_CURRENT_USER, uintptr(unsafe.Pointer(keyNamePtr)), 0, KEY_WRITE, uintptr(unsafe.Pointer(&hCheckKey)))
+	if retCheck != 0 {
+		t.Skipf("skipping TestAutostartCycle: registry write to HKCU Run key not permitted in current sandbox environment (ret=%d)", retCheck)
+		return
+	}
+	procRegCloseKey.Call(hCheckKey)
+
 	// 1. Enable autostart with current executable
 	setAutostart(true)
 	if !isAutostartEnabled() {
@@ -670,7 +684,6 @@ func TestAutostartCycle(t *testing.T) {
 
 	// 2. Query registry value to ensure it contains --minimized
 	var hKey uintptr
-	keyNamePtr := syscall.StringToUTF16Ptr(runKeyPath)
 	ret, _, _ := procRegOpenKeyEx.Call(HKEY_CURRENT_USER, uintptr(unsafe.Pointer(keyNamePtr)), 0, KEY_READ, uintptr(unsafe.Pointer(&hKey)))
 	if ret == 0 {
 		defer procRegCloseKey.Call(hKey)
@@ -708,6 +721,156 @@ func TestAutostartCycle(t *testing.T) {
 				procRegCloseKey.Call(hWriteKey)
 			}
 		}
+	}
+}
+
+func TestIgnoredProcessesConfigPersistenceAndCustomEntries(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgFile := filepath.Join(tmpDir, "settings.json")
+
+	// 1. Initial load without ignored_processes in file -> auto populates defaults & writes back
+	initialJSON := []byte(`{"enabled": true, "fade": false, "processes": ["game.exe"]}`)
+	_ = os.WriteFile(cfgFile, initialJSON, 0644)
+
+	testApp := App{
+		configPath: cfgFile,
+	}
+	testApp.loadConfig()
+
+	if len(testApp.config.IgnoredProcesses) == 0 {
+		t.Fatalf("expected IgnoredProcesses to be auto-populated with defaults, got empty slice")
+	}
+
+	// Verify that the file on disk was updated to include ignored_processes
+	diskData, err := os.ReadFile(cfgFile)
+	if err != nil {
+		t.Fatalf("failed to read updated config file: %v", err)
+	}
+	var reloaded ConfigData
+	if err := json.Unmarshal(diskData, &reloaded); err != nil {
+		t.Fatalf("failed to unmarshal updated config: %v", err)
+	}
+	if len(reloaded.IgnoredProcesses) != len(defaultIgnoredProcesses) {
+		t.Errorf("expected disk config to have %d ignored processes, got %d", len(defaultIgnoredProcesses), len(reloaded.IgnoredProcesses))
+	}
+
+	// 2. Custom ignore process added to config
+	reloaded.IgnoredProcesses = append(reloaded.IgnoredProcesses, "mycustomoverlay.exe")
+	updatedData, _ := json.MarshalIndent(reloaded, "", "    ")
+	_ = os.WriteFile(cfgFile, updatedData, 0644)
+
+	testApp2 := App{
+		configPath: cfgFile,
+	}
+	testApp2.loadConfig()
+
+	// Switch app global instance to testApp2's ignored map to test isIgnoredExternalApp
+	oldIgnored := app.ignored
+	app.ignored = testApp2.ignored
+	defer func() {
+		app.ignored = oldIgnored
+	}()
+
+	if !isIgnoredExternalApp("mycustomoverlay.exe") {
+		t.Errorf("expected custom ignored process 'mycustomoverlay.exe' to be ignored")
+	}
+	if !isIgnoredExternalApp("MyCustomOverlay.EXE") {
+		t.Errorf("expected case-insensitive matching for 'MyCustomOverlay.EXE'")
+	}
+	if !isIgnoredExternalApp("mycustomoverlay") {
+		t.Errorf("expected extension-trimmed matching for 'mycustomoverlay'")
+	}
+
+	// Hardcoded safeguards still active
+	if !isIgnoredExternalApp("automute.exe") {
+		t.Errorf("expected hardcoded safeguard for automute.exe")
+	}
+	if !isIgnoredExternalApp("system") {
+		t.Errorf("expected hardcoded safeguard for system")
+	}
+}
+
+func TestProcessSnapshotDescendantMatching(t *testing.T) {
+	// Construct simulated process tree:
+	// PID 100: explorer.exe
+	//   -> PID 1000: 红果短剧.exe
+	//        -> PID 1004: msedgewebview2.exe (Renderer/Audio worker)
+	//             -> PID 1008: ffmpeg_worker.exe
+	//   -> PID 2000: msedge.exe (Independent browser)
+	//        -> PID 2004: msedgewebview2.exe (Edge internal)
+	snap := processSnapshot{
+		parentMap: map[uint32]uint32{
+			1000: 100,
+			1004: 1000,
+			1008: 1004,
+			2000: 100,
+			2004: 2000,
+		},
+		nameMap: map[uint32]string{
+			100:  "explorer.exe",
+			1000: "红果短剧.exe",
+			1004: "msedgewebview2.exe",
+			1008: "ffmpeg_worker.exe",
+			2000: "msedge.exe",
+			2004: "msedgewebview2.exe",
+		},
+	}
+
+	// 1. Exact match
+	if !snap.isDescendantOf(1000, "红果短剧.exe") {
+		t.Errorf("expected exact process to match itself")
+	}
+	if !snap.isDescendantOf(1000, "红果短剧") {
+		t.Errorf("expected suffix-trimmed target name to match")
+	}
+
+	// 2. Child process match
+	if !snap.isDescendantOf(1004, "红果短剧.exe") {
+		t.Errorf("expected child process 1004 (msedgewebview2.exe) to match parent '红果短剧.exe'")
+	}
+
+	// 3. Grandchild process match
+	if !snap.isDescendantOf(1008, "红果短剧.exe") {
+		t.Errorf("expected grandchild process 1008 to match root '红果短剧.exe'")
+	}
+
+	// 4. Isolation: Edge's msedgewebview2 (PID 2004) must NOT match "红果短剧.exe"
+	if snap.isDescendantOf(2004, "红果短剧.exe") {
+		t.Errorf("unrelated child process 2004 should NOT match '红果短剧.exe'")
+	}
+	if !snap.isDescendantOf(2004, "msedge.exe") {
+		t.Errorf("expected 2004 to match 'msedge.exe'")
+	}
+
+	// 5. Root app attribution
+	if root := snap.getRootAppName(1004); root != "红果短剧.exe" {
+		t.Errorf("expected getRootAppName(1004) to resolve to '红果短剧.exe', got %q", root)
+	}
+	if root := snap.getRootAppName(1008); root != "红果短剧.exe" {
+		t.Errorf("expected getRootAppName(1008) to resolve to '红果短剧.exe', got %q", root)
+	}
+
+	// 6. Loop and cycle safety (e.g. self-referencing parent)
+	cyclicSnap := processSnapshot{
+		parentMap: map[uint32]uint32{
+			3000: 3000, // points to self
+			3001: 3002,
+			3002: 3001, // mutual cycle
+		},
+		nameMap: map[uint32]string{
+			3000: "cycleA.exe",
+			3001: "cycleB.exe",
+			3002: "cycleC.exe",
+		},
+	}
+	if !cyclicSnap.isDescendantOf(3000, "cycleA.exe") {
+		t.Errorf("expected self match even with loop")
+	}
+	if cyclicSnap.isDescendantOf(3000, "nonexistent.exe") {
+		t.Errorf("expected non-existent search to safely terminate on cycle")
+	}
+	if cyclicSnap.isDescendantOf(3001, "nonexistent.exe") {
+		t.Errorf("expected mutual cycle to safely terminate")
 	}
 }
 

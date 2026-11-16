@@ -286,10 +286,21 @@ type OPENFILENAMEW struct {
 	FlagsEx           uint32
 }
 
+var defaultIgnoredProcesses = []string{
+	"applicationframehost.exe",
+	"explorer.exe",
+	"searchhost.exe",
+	"shellexperiencehost.exe",
+	"shellhost.exe",
+	"startmenuexperiencehost.exe",
+	"systemsettings.exe",
+}
+
 type ConfigData struct {
-	Enabled   bool     `json:"enabled"`
-	Fade      bool     `json:"fade"`
-	Processes []string `json:"processes"`
+	Enabled          bool     `json:"enabled"`
+	Fade             bool     `json:"fade"`
+	Processes        []string `json:"processes"`
+	IgnoredProcesses []string `json:"ignored_processes"`
 }
 
 type App struct {
@@ -297,6 +308,7 @@ type App struct {
 	configPath        string
 	lastConfigModTime time.Time
 	managed           map[string]bool
+	ignored           map[string]bool
 	currentFg         string
 	externalFg        string // Tracks the most recent non-AutoMute foreground application
 	selfName          string // Lowercased name of AutoMute executable
@@ -323,6 +335,7 @@ type App struct {
 
 var app = App{
 	fadeSeq: make(map[string]uint64),
+	ignored: make(map[string]bool),
 }
 
 func callCOM(obj uintptr, index int, args ...uintptr) (uintptr, uintptr, error) {
@@ -355,6 +368,87 @@ type PROCESSENTRY32W struct {
 	PcPriClassBase      int32
 	DwFlags             uint32
 	SzExeFile           [260]uint16
+}
+
+type processSnapshot struct {
+	parentMap map[uint32]uint32 // childPid -> parentPid
+	nameMap   map[uint32]string // pid -> lowercase process name
+}
+
+func buildProcessSnapshot() processSnapshot {
+	snap := processSnapshot{
+		parentMap: make(map[uint32]uint32),
+		nameMap:   make(map[uint32]string),
+	}
+	const TH32CS_SNAPPROCESS = 0x00000002
+	h, _, _ := procCreateToolhelp32Snapshot.Call(TH32CS_SNAPPROCESS, 0)
+	if h == 0 || h == ^uintptr(0) {
+		return snap
+	}
+	defer procCloseHandle.Call(h)
+
+	var pe PROCESSENTRY32W
+	pe.DwSize = uint32(unsafe.Sizeof(pe))
+	ret, _, _ := procProcess32First.Call(h, uintptr(unsafe.Pointer(&pe)))
+	for ret != 0 {
+		name := strings.ToLower(filepath.Base(syscall.UTF16ToString(pe.SzExeFile[:])))
+		snap.parentMap[pe.Th32ProcessID] = pe.Th32ParentProcessID
+		snap.nameMap[pe.Th32ProcessID] = name
+		ret, _, _ = procProcess32Next.Call(h, uintptr(unsafe.Pointer(&pe)))
+	}
+	return snap
+}
+
+func (snap *processSnapshot) isDescendantOf(pid uint32, targetProc string) bool {
+	targetProc = strings.ToLower(strings.TrimSpace(targetProc))
+	if targetProc == "" {
+		return false
+	}
+	curr := pid
+	visited := 0
+	for curr != 0 && curr != 4 && visited < 16 {
+		name, ok := snap.nameMap[curr]
+		if !ok {
+			name = getProcessName(curr)
+		}
+		if name != "" {
+			if strings.EqualFold(name, targetProc) || strings.EqualFold(strings.TrimSuffix(name, ".exe"), strings.TrimSuffix(targetProc, ".exe")) {
+				return true
+			}
+		}
+		parent, hasParent := snap.parentMap[curr]
+		if !hasParent || parent == curr || parent == 0 || parent == 4 {
+			break
+		}
+		curr = parent
+		visited++
+	}
+	return false
+}
+
+func (snap *processSnapshot) getRootAppName(pid uint32) string {
+	curr := pid
+	visited := 0
+	bestName := ""
+	for curr != 0 && curr != 4 && visited < 16 {
+		name, ok := snap.nameMap[curr]
+		if !ok {
+			name = getProcessName(curr)
+		}
+		if name != "" && !isIgnoredExternalApp(name) {
+			bestName = name
+		}
+		parent, hasParent := snap.parentMap[curr]
+		if !hasParent || parent == curr || parent == 0 || parent == 4 {
+			break
+		}
+		curr = parent
+		visited++
+	}
+	if bestName != "" {
+		return bestName
+	}
+	return getProcessName(pid)
 }
 
 func getProcNameByToolhelp(pid uint32) string {
@@ -412,7 +506,19 @@ func getForegroundProcess() string {
 	if pid == uint32(os.Getpid()) {
 		return "automute.exe"
 	}
-	return getProcessName(pid)
+	name := getProcessName(pid)
+	if isIgnoredExternalApp(name) {
+		return name
+	}
+	// If the foreground window belongs to an embedded child renderer (such as msedgewebview2.exe),
+	// trace up to its parent/root user-facing application name.
+	if strings.EqualFold(name, "msedgewebview2.exe") {
+		snap := buildProcessSnapshot()
+		if root := snap.getRootAppName(pid); root != "" && !strings.EqualFold(root, "msedgewebview2.exe") {
+			return root
+		}
+	}
+	return name
 }
 
 // Registry Autostart Operations
@@ -474,6 +580,7 @@ func shouldStartMinimized(args []string) bool {
 
 func (a *App) loadConfig() {
 	a.managed = make(map[string]bool)
+	a.ignored = make(map[string]bool)
 	if fi, err := os.Stat(a.configPath); err == nil {
 		a.lastConfigModTime = fi.ModTime()
 	}
@@ -482,6 +589,27 @@ func (a *App) loadConfig() {
 		var cfg ConfigData
 		if err := json.Unmarshal(data, &cfg); err == nil {
 			a.config = cfg
+
+			// 1. Populate & sanitize IgnoredProcesses
+			needSave := false
+			if len(cfg.IgnoredProcesses) == 0 {
+				cfg.IgnoredProcesses = append([]string(nil), defaultIgnoredProcesses...)
+				needSave = true
+			}
+
+			cleanIgnored := make([]string, 0, len(cfg.IgnoredProcesses))
+			for _, ip := range cfg.IgnoredProcesses {
+				cip := cleanProcessName(ip)
+				if cip != "" {
+					a.ignored[cip] = true
+					a.ignored[strings.TrimSuffix(cip, ".exe")] = true
+					cleanIgnored = append(cleanIgnored, cip)
+				}
+			}
+			sort.Strings(cleanIgnored)
+			a.config.IgnoredProcesses = cleanIgnored
+
+			// 2. Populate & sanitize Processes
 			cleanProcs := make([]string, 0, len(cfg.Processes))
 			for _, p := range cfg.Processes {
 				cp := cleanProcessName(p)
@@ -492,16 +620,25 @@ func (a *App) loadConfig() {
 			}
 			sort.Strings(cleanProcs)
 			a.config.Processes = cleanProcs
+
+			if needSave {
+				a.saveConfig()
+			}
 			return
 		}
 	}
 
 	a.config = ConfigData{
-		Enabled:   true,
-		Fade:      true,
-		Processes: []string{"msedge.exe"},
+		Enabled:          true,
+		Fade:             true,
+		Processes:        []string{"msedge.exe"},
+		IgnoredProcesses: append([]string(nil), defaultIgnoredProcesses...),
 	}
 	a.managed["msedge.exe"] = true
+	for _, ip := range defaultIgnoredProcesses {
+		a.ignored[ip] = true
+		a.ignored[strings.TrimSuffix(ip, ".exe")] = true
+	}
 	if os.IsNotExist(err) {
 		a.saveConfig()
 	}
@@ -514,6 +651,10 @@ func (a *App) saveConfig() {
 	}
 	sort.Strings(procs)
 	a.config.Processes = procs
+
+	if len(a.config.IgnoredProcesses) == 0 {
+		a.config.IgnoredProcesses = append([]string(nil), defaultIgnoredProcesses...)
+	}
 
 	if data, err := json.MarshalIndent(a.config, "", "    "); err == nil {
 		if dir := filepath.Dir(a.configPath); dir != "" {
@@ -584,6 +725,11 @@ func iterateProcessAudioVolumes(targetProc string, fn func(pVol uintptr)) {
 
 	var count int32
 	callCOM(pSessEnum, 3, uintptr(unsafe.Pointer(&count)))
+	if count <= 0 {
+		return
+	}
+
+	snap := buildProcessSnapshot()
 
 	for i := int32(0); i < count; i++ {
 		var pSessCtrl uintptr
@@ -602,8 +748,7 @@ func iterateProcessAudioVolumes(targetProc string, fn func(pVol uintptr)) {
 		callCOM(pCtrl2, 14, uintptr(unsafe.Pointer(&pid)))
 		callCOM(pCtrl2, 2)
 
-		pName := getProcessName(pid)
-		if strings.EqualFold(pName, targetProc) {
+		if snap.isDescendantOf(pid, targetProc) {
 			var pVol uintptr
 			hr, _, _ = callCOM(pSessCtrl, 0, uintptr(unsafe.Pointer(&IID_ISimpleAudioVolume)), uintptr(unsafe.Pointer(&pVol)))
 			if int32(hr) >= 0 && pVol != 0 {
@@ -768,7 +913,7 @@ func isIgnoredExternalApp(name string) bool {
 	if name == "" || strings.HasPrefix(name, "[") {
 		return true
 	}
-	lower := strings.ToLower(name)
+	lower := strings.ToLower(strings.TrimSpace(name))
 	if lower == ".exe" {
 		return true
 	}
@@ -776,12 +921,22 @@ func isIgnoredExternalApp(name string) bool {
 	if lower == app.selfName || (baseSelf != "" && (lower == baseSelf || lower == baseSelf+".exe")) {
 		return true
 	}
-	switch lower {
-	case "automute.exe", "automute", "system", "system.exe", "explorer.exe", "explorer", "searchhost.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe":
+	if lower == "system" || lower == "system.exe" || lower == "automute.exe" || lower == "automute" {
 		return true
-	default:
-		return false
 	}
+
+	// 1. Check user-configured ignore list from settings.json
+	if len(app.ignored) > 0 {
+		return app.ignored[lower] || app.ignored[strings.TrimSuffix(lower, ".exe")] || app.ignored[lower+".exe"]
+	}
+
+	// 2. Fallback to defaultIgnoredProcesses if app.ignored has not been initialized
+	for _, def := range defaultIgnoredProcesses {
+		if lower == def || lower == strings.TrimSuffix(def, ".exe") {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *App) onForegroundChanged(fgProc string) {
