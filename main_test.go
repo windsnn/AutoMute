@@ -874,4 +874,64 @@ func TestProcessSnapshotDescendantMatching(t *testing.T) {
 	}
 }
 
+func TestMessageBoxAndUIConstants(t *testing.T) {
+	if MB_YESNO != 0x00000004 {
+		t.Errorf("MB_YESNO = 0x%x; want 0x4", MB_YESNO)
+	}
+	if MB_ICONQUESTION != 0x00000020 {
+		t.Errorf("MB_ICONQUESTION = 0x%x; want 0x20", MB_ICONQUESTION)
+	}
+	if MB_ICONWARNING != 0x00000030 {
+		t.Errorf("MB_ICONWARNING = 0x%x; want 0x30", MB_ICONWARNING)
+	}
+	if MB_DEFBUTTON2 != 0x00000100 {
+		t.Errorf("MB_DEFBUTTON2 = 0x%x; want 0x100", MB_DEFBUTTON2)
+	}
+	if IDYES != 6 || IDNO != 7 {
+		t.Errorf("IDYES=%d (want 6), IDNO=%d (want 7)", IDYES, IDNO)
+	}
+	if SS_CENTER != 0x1 {
+		t.Errorf("SS_CENTER = 0x%x; want 0x1", SS_CENTER)
+	}
+	if IDC_LBL_COUNT <= IDC_LBL_STATUS {
+		t.Errorf("IDC_LBL_COUNT (%d) must be greater than IDC_LBL_STATUS (%d)", IDC_LBL_COUNT, IDC_LBL_STATUS)
+	}
+}
+
+func TestStatusTextAndAddFgButtonWording(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgFile := filepath.Join(tmpDir, "settings.json")
+	testApp := App{
+		configPath: cfgFile,
+		managed:    make(map[string]bool),
+		ignored:    make(map[string]bool),
+		fadeSeq:    make(map[string]uint64),
+	}
+	testApp.config = ConfigData{
+		Enabled:   true,
+		Fade:      true,
+		Processes: []string{"game.exe"},
+	}
+	testApp.managed["game.exe"] = true
+
+	// 1. Initial / empty foreground
+	testApp.externalFg = ""
+	testApp.updateAddFgButton()
+	testApp.updateStatusText()
+
+	// 2. Unmanaged foreground
+	testApp.externalFg = "notepad.exe"
+	testApp.updateAddFgButton()
+	testApp.updateStatusText()
+
+	// 3. Managed foreground
+	testApp.externalFg = "game.exe"
+	testApp.updateAddFgButton()
+	testApp.updateStatusText()
+
+	// 4. Disabled state
+	testApp.config.Enabled = false
+	testApp.updateStatusText()
+}
+
 

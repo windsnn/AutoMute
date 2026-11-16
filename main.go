@@ -177,6 +177,25 @@ const (
 	OFN_FILEMUSTEXIST = 0x00001000
 	OFN_PATHMUSTEXIST = 0x00000800
 	OFN_NOCHANGEDIR   = 0x00000008
+
+	// Win32 MessageBox & Static Constants
+	MB_OK              = 0x00000000
+	MB_OKCANCEL        = 0x00000001
+	MB_YESNO           = 0x00000004
+	MB_ICONERROR       = 0x00000010
+	MB_ICONQUESTION    = 0x00000020
+	MB_ICONWARNING     = 0x00000030
+	MB_ICONINFORMATION = 0x00000040
+	MB_DEFBUTTON2      = 0x00000100
+
+	IDOK     = 1
+	IDCANCEL = 2
+	IDYES    = 6
+	IDNO     = 7
+
+	SS_LEFT   = 0x00000000
+	SS_CENTER = 0x00000001
+	SS_RIGHT  = 0x00000002
 )
 
 // UI Control IDs
@@ -193,6 +212,7 @@ const (
 	IDC_CHK_FADE
 	IDC_CHK_AUTOSTART
 	IDC_LBL_STATUS
+	IDC_LBL_COUNT
 )
 
 // Tray Menu IDs
@@ -327,6 +347,7 @@ type App struct {
 	chkFade    uintptr
 	chkAuto    uintptr
 	lblStatus  uintptr
+	lblCount   uintptr
 
 	// Fade Concurrency State
 	fadeMu  sync.Mutex
@@ -953,7 +974,20 @@ func (a *App) onForegroundChanged(fgProc string) {
 		a.externalFg = fgProc
 		a.updateAddFgButton()
 		if a.edtProcess != 0 {
-			procSetWindowText.Call(a.edtProcess, uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(fgProc))))
+			var curBuf [256]uint16
+			procGetWindowText.Call(a.edtProcess, uintptr(unsafe.Pointer(&curBuf[0])), 256)
+			curText := strings.TrimSpace(syscall.UTF16ToString(curBuf[:]))
+			if a.managed[fgProc] {
+				// If the foreground app is already managed, clear it from edtProcess so we don't duplicate
+				if strings.EqualFold(curText, fgProc) {
+					procSetWindowText.Call(a.edtProcess, uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(""))))
+				}
+			} else {
+				// Suggest unmanaged foreground app if the box is empty or was previous foreground
+				if curText == "" || strings.EqualFold(curText, a.currentFg) {
+					procSetWindowText.Call(a.edtProcess, uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(fgProc))))
+				}
+			}
 		}
 	}
 
@@ -1012,12 +1046,12 @@ func (a *App) updateAddFgButton() {
 	if a.btnAddFg == 0 {
 		return
 	}
-	label := "+ 一键添加当前前台应用"
+	label := "+ 一键添加识别到的应用 (切换到目标软件后再切回即可识别)"
 	if a.externalFg != "" {
 		if a.managed[a.externalFg] {
-			label = fmt.Sprintf("✓ 已接管: %s (点击取消接管)", a.externalFg)
+			label = fmt.Sprintf("✓ 已在静音列表中: %s (点击取消接管)", a.externalFg)
 		} else {
-			label = fmt.Sprintf("+ 一键添加并静音: %s [未接管]", a.externalFg)
+			label = fmt.Sprintf("+ 一键添加并静音: %s [未接管，点击添加]", a.externalFg)
 		}
 	}
 	procSetWindowText.Call(a.btnAddFg, uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(label))))
@@ -1043,6 +1077,10 @@ func (a *App) refreshListBox() {
 	procSendMessage.Call(a.chkEnable, BM_SETCHECK, boolToCheck(a.config.Enabled), 0)
 	procSendMessage.Call(a.chkFade, BM_SETCHECK, boolToCheck(a.config.Fade), 0)
 	procSendMessage.Call(a.chkAuto, BM_SETCHECK, boolToCheck(isAutostartEnabled()), 0)
+	if a.lblCount != 0 {
+		txt := fmt.Sprintf("已配置: %d 个应用", len(procs))
+		procSetWindowText.Call(a.lblCount, uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(txt))))
+	}
 	a.updateStatusText()
 	a.updateAddFgButton()
 }
@@ -1182,31 +1220,55 @@ func wndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
 			var buf [256]uint16
 			procGetWindowText.Call(app.edtProcess, uintptr(unsafe.Pointer(&buf[0])), 256)
 			name := cleanProcessName(syscall.UTF16ToString(buf[:]))
-			if name != "" && !isIgnoredExternalApp(name) {
-				app.managed[name] = true
-				app.saveConfig()
-				app.applyMuteState(app.config.Fade)
-				app.refreshListBox()
-				procSetWindowText.Call(app.edtProcess, uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(""))))
+			if name == "" {
+				procMessageBox.Call(
+					hwnd,
+					uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("请输入有效的进程名称（例如 game.exe）或点击“浏览 exe...”选取。"))),
+					uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("提示"))),
+					uintptr(MB_OK|MB_ICONINFORMATION),
+				)
+				return 0
 			}
+			if isIgnoredExternalApp(name) {
+				procMessageBox.Call(
+					hwnd,
+					uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(fmt.Sprintf("“%s” 属于系统保留或已被忽略的进程，无需加入静音列表。", name)))),
+					uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("提示"))),
+					uintptr(MB_OK|MB_ICONINFORMATION),
+				)
+				return 0
+			}
+			if app.managed[name] {
+				procMessageBox.Call(
+					hwnd,
+					uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(fmt.Sprintf("“%s” 已在自动静音列表中。", name)))),
+					uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("提示"))),
+					uintptr(MB_OK|MB_ICONINFORMATION),
+				)
+				return 0
+			}
+			app.managed[name] = true
+			app.saveConfig()
+			app.applyMuteState(app.config.Fade)
+			app.refreshListBox()
+			procSetWindowText.Call(app.edtProcess, uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(""))))
 
 		case IDC_LST_MANAGED:
-			notifyCode := (wParam >> 16) & 0xffff
-			if notifyCode == 1 { // LBN_SELCHANGE
-				idx, _, _ := procSendMessage.Call(app.lstManaged, LB_GETCURSEL, 0, 0)
-				if int(idx) >= 0 {
-					var buf [256]uint16
-					procSendMessage.Call(app.lstManaged, LB_GETTEXT, idx, uintptr(unsafe.Pointer(&buf[0])))
-					pName := syscall.UTF16ToString(buf[:])
-					if pName != "" {
-						procSetWindowText.Call(app.edtProcess, uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(pName))))
-					}
-				}
-			}
+			// Selection change notification
 
 		case IDC_BTN_ADDFG:
 			if app.externalFg != "" && !isIgnoredExternalApp(app.externalFg) {
 				if app.managed[app.externalFg] {
+					msg := fmt.Sprintf("确定要取消接管并从静音列表中移除该进程吗？\n\n进程: %s", app.externalFg)
+					ret, _, _ := procMessageBox.Call(
+						hwnd,
+						uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(msg))),
+						uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("确认取消接管"))),
+						uintptr(MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2),
+					)
+					if ret != uintptr(IDYES) {
+						return 0
+					}
 					app.cancelFade(app.externalFg)
 					delete(app.managed, app.externalFg)
 					app.saveConfig()
@@ -1217,6 +1279,13 @@ func wndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
 					app.saveConfig()
 					app.applyMuteState(app.config.Fade)
 					app.refreshListBox()
+					if app.edtProcess != 0 {
+						var buf [256]uint16
+						procGetWindowText.Call(app.edtProcess, uintptr(unsafe.Pointer(&buf[0])), 256)
+						if strings.EqualFold(syscall.UTF16ToString(buf[:]), app.externalFg) {
+							procSetWindowText.Call(app.edtProcess, uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(""))))
+						}
+					}
 				}
 			}
 
@@ -1228,10 +1297,29 @@ func wndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
 
 		case IDC_BTN_REMOVE:
 			idx, _, _ := procSendMessage.Call(app.lstManaged, LB_GETCURSEL, 0, 0)
-			if int(idx) >= 0 {
-				var buf [256]uint16
-				procSendMessage.Call(app.lstManaged, LB_GETTEXT, idx, uintptr(unsafe.Pointer(&buf[0])))
-				pName := syscall.UTF16ToString(buf[:])
+			if int(idx) < 0 {
+				procMessageBox.Call(
+					hwnd,
+					uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("请先在列表中选中要移除的进程。"))),
+					uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("提示"))),
+					uintptr(MB_OK|MB_ICONINFORMATION),
+				)
+				return 0
+			}
+			var buf [256]uint16
+			procSendMessage.Call(app.lstManaged, LB_GETTEXT, idx, uintptr(unsafe.Pointer(&buf[0])))
+			pName := syscall.UTF16ToString(buf[:])
+			if pName == "" {
+				return 0
+			}
+			msg := fmt.Sprintf("确定要从自动静音列表中移除该进程吗？\n\n进程: %s", pName)
+			ret, _, _ := procMessageBox.Call(
+				hwnd,
+				uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(msg))),
+				uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("确认移除进程"))),
+				uintptr(MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2),
+			)
+			if ret == uintptr(IDYES) {
 				app.cancelFade(pName)
 				delete(app.managed, pName)
 				app.saveConfig()
@@ -1240,10 +1328,29 @@ func wndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
 			}
 
 		case IDC_BTN_CLEAR:
-			app.restoreAllManaged()
-			app.managed = make(map[string]bool)
-			app.saveConfig()
-			app.refreshListBox()
+			count := len(app.managed)
+			if count == 0 {
+				procMessageBox.Call(
+					hwnd,
+					uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("当前静音列表为空，无需清空。"))),
+					uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("提示"))),
+					uintptr(MB_OK|MB_ICONINFORMATION),
+				)
+				return 0
+			}
+			msg := fmt.Sprintf("确定要清空所有已配置的自动静音进程吗？\n\n此操作将移除全部 %d 个进程，并恢复它们的系统音量。", count)
+			ret, _, _ := procMessageBox.Call(
+				hwnd,
+				uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(msg))),
+				uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("确认清空列表"))),
+				uintptr(MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2),
+			)
+			if ret == uintptr(IDYES) {
+				app.restoreAllManaged()
+				app.managed = make(map[string]bool)
+				app.saveConfig()
+				app.refreshListBox()
+			}
 
 		case IDC_BTN_OPEN_CONFIG:
 			cfgAbs, _ := filepath.Abs(app.configPath)
@@ -1499,9 +1606,9 @@ func main() {
 	}
 	procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
 
-	// 6. Create Main Window (Task Manager style: 560x480, non-resizable)
+	// 6. Create Main Window (Task Manager style: 560x440, non-resizable)
 	winWidth := 560
-	winHeight := 480
+	winHeight := 440
 	xPos := (1920 - winWidth) / 2
 	yPos := (1080 - winHeight) / 2
 	if xPos < 50 {
@@ -1534,34 +1641,35 @@ func main() {
 	}
 
 	// 7. Create UI Controls
-	// Header Label
-	createControl("STATIC", "已配置的后台自动静音进程列表 (白名单):", 0, 20, 15, 500, 20, 0, hwnd, hInstance, hFont)
+	// Top Section: Process Whitelist & Management Toolbar
+	createControl("STATIC", "已配置的后台自动静音进程列表 (白名单):", 0, 20, 14, 370, 18, 0, hwnd, hInstance, hFont)
 
 	// Process ListBox
-	app.lstManaged = createControl("LISTBOX", "", WS_BORDER|WS_VSCROLL|LBS_NOTIFY, 20, 38, 505, 175, IDC_LST_MANAGED, hwnd, hInstance, hFont)
+	app.lstManaged = createControl("LISTBOX", "", WS_BORDER|WS_VSCROLL|LBS_NOTIFY, 20, 36, 370, 152, IDC_LST_MANAGED, hwnd, hInstance, hFont)
 
-	// Add Row 1: Manual Input + Browse
-	createControl("STATIC", "添加进程:", 0, 20, 225, 70, 24, 0, hwnd, hInstance, hFont)
-	app.edtProcess = createControl("EDIT", "", WS_BORDER|ES_AUTOHSCROLL, 95, 222, 215, 25, IDC_EDT_PROCESS, hwnd, hInstance, hFont)
-	createControl("BUTTON", "浏览 exe...", BS_PUSHBUTTON, 320, 221, 105, 27, IDC_BTN_BROWSE, hwnd, hInstance, hFont)
-	createControl("BUTTON", "+ 手动添加", BS_PUSHBUTTON, 435, 221, 90, 27, IDC_BTN_ADD, hwnd, hInstance, hFont)
+	// List Action Buttons Column (aligned with right edge at x=524)
+	createControl("BUTTON", "- 移除选中", BS_PUSHBUTTON, 404, 36, 120, 28, IDC_BTN_REMOVE, hwnd, hInstance, hFont)
+	createControl("BUTTON", "清空列表", BS_PUSHBUTTON, 404, 72, 120, 28, IDC_BTN_CLEAR, hwnd, hInstance, hFont)
+	createControl("BUTTON", "打开配置文件", BS_PUSHBUTTON, 404, 108, 120, 28, IDC_BTN_OPEN_CONFIG, hwnd, hInstance, hFont)
+	app.lblCount = createControl("STATIC", "已配置: 0 个应用", SS_CENTER, 404, 156, 120, 20, IDC_LBL_COUNT, hwnd, hInstance, hFont)
 
-	// Add Row 2: Quick Add Current/Recent Foreground App
-	app.btnAddFg = createControl("BUTTON", "+ 一键添加前台应用", BS_PUSHBUTTON, 20, 258, 505, 32, IDC_BTN_ADDFG, hwnd, hInstance, hFont)
+	// Middle Section: Add Application
+	createControl("STATIC", "添加进程:", 0, 20, 208, 65, 20, 0, hwnd, hInstance, hFont)
+	app.edtProcess = createControl("EDIT", "", WS_BORDER|ES_AUTOHSCROLL, 88, 204, 216, 26, IDC_EDT_PROCESS, hwnd, hInstance, hFont)
+	createControl("BUTTON", "浏览 exe...", BS_PUSHBUTTON, 314, 203, 82, 28, IDC_BTN_BROWSE, hwnd, hInstance, hFont)
+	createControl("BUTTON", "+ 手动添加", BS_PUSHBUTTON, 404, 203, 120, 28, IDC_BTN_ADD, hwnd, hInstance, hFont)
 
-	// Action Buttons
-	createControl("BUTTON", "- 移除选中的进程", BS_PUSHBUTTON, 20, 300, 140, 28, IDC_BTN_REMOVE, hwnd, hInstance, hFont)
-	createControl("BUTTON", "清空列表", BS_PUSHBUTTON, 170, 300, 90, 28, IDC_BTN_CLEAR, hwnd, hInstance, hFont)
-	createControl("BUTTON", "打开配置文件", BS_PUSHBUTTON, 270, 300, 110, 28, IDC_BTN_OPEN_CONFIG, hwnd, hInstance, hFont)
+	// Foreground Quick-Add Banner Button
+	app.btnAddFg = createControl("BUTTON", "+ 一键添加前台应用", BS_PUSHBUTTON, 20, 241, 504, 32, IDC_BTN_ADDFG, hwnd, hInstance, hFont)
 
-	// Settings Checkboxes (Row 4: 启用静音 + 平滑淡入淡出 + 开机自启动)
-	app.chkEnable = createControl("BUTTON", "启用后台自动静音", BS_AUTOCHECKBOX, 20, 342, 150, 24, IDC_CHK_ENABLE, hwnd, hInstance, hFont)
-	app.chkFade = createControl("BUTTON", "平滑淡入淡出 (1.0s)", BS_AUTOCHECKBOX, 180, 342, 170, 24, IDC_CHK_FADE, hwnd, hInstance, hFont)
-	app.chkAuto = createControl("BUTTON", "开机自启动", BS_AUTOCHECKBOX, 360, 342, 120, 24, IDC_CHK_AUTOSTART, hwnd, hInstance, hFont)
+	// Bottom Section: Global Options Checkboxes
+	app.chkEnable = createControl("BUTTON", "启用后台自动静音", BS_AUTOCHECKBOX, 20, 289, 155, 24, IDC_CHK_ENABLE, hwnd, hInstance, hFont)
+	app.chkFade = createControl("BUTTON", "平滑淡入淡出 (1.0s)", BS_AUTOCHECKBOX, 185, 289, 175, 24, IDC_CHK_FADE, hwnd, hInstance, hFont)
+	app.chkAuto = createControl("BUTTON", "开机自启动", BS_AUTOCHECKBOX, 370, 289, 154, 24, IDC_CHK_AUTOSTART, hwnd, hInstance, hFont)
 
 	// Status & Tip
-	app.lblStatus = createControl("STATIC", "状态: 初始化中...", 0, 20, 382, 505, 24, IDC_LBL_STATUS, hwnd, hInstance, hFont)
-	createControl("STATIC", "提示: 点击右上角 [X] 关闭按钮将最小化到右下角托盘并在后台静默工作", 0, 20, 408, 505, 20, 0, hwnd, hInstance, hFont)
+	app.lblStatus = createControl("STATIC", "状态: 初始化中...", 0, 20, 325, 504, 20, IDC_LBL_STATUS, hwnd, hInstance, hFont)
+	createControl("STATIC", "提示: 点击右上角 [X] 关闭按钮将最小化到右下角托盘并在后台静默工作", 0, 20, 351, 504, 20, 0, hwnd, hInstance, hFont)
 
 	// 8. Setup System Tray Icon
 	app.nid = NOTIFYICONDATAW{
